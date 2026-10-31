@@ -48,16 +48,21 @@ impl Collection {
             .storage
             .get_note_tags_by_predicate(|tags| matcher.is_match(tags))?;
         let match_count = matched_notes.len();
-        if match_count == 0 {
-            // no matches; exit early so we don't clobber the empty tag entries
-            return Ok(0);
-        }
 
         // remove old prefixes from the tag list
         for tag in self
             .storage
             .get_tags_by_predicate(|tag| matcher.is_match(tag))?
         {
+            // Take the entry's new name from the entry itself. `into_new_tags()`
+            // only collects what the note replacements below produce, so a tag
+            // no note carries would be removed here and never registered again.
+            matcher.replace_with_fn(&tag.name, |cap| {
+                old_to_new_names
+                    .get(&UniCase::new(cap.to_string()))
+                    .unwrap()
+                    .clone()
+            });
             self.remove_single_tag_undoable(tag)?;
         }
 
@@ -138,6 +143,97 @@ mod test {
             .into_iter()
             .map(|t| t.name)
             .collect()
+    }
+
+    /// Add a note carrying `tags`, then clear its tags, leaving the tag-list
+    /// entries behind with no note referencing them. This is the state the
+    /// collection is in until "Clear Unused Tags" is run.
+    fn add_unused_tags(col: &mut Collection, tags: &[&str]) -> Result<()> {
+        let nt = col.get_notetype_by_name("Basic")?.unwrap();
+        let mut note = nt.new_note();
+        note.tags = tags.iter().map(|t| t.to_string()).collect();
+        col.add_note(&mut note, DeckId(1))?;
+        note.tags.clear();
+        col.update_note(&mut note)?;
+        Ok(())
+    }
+
+    fn add_note_with_tag(col: &mut Collection, tag: &str) -> Result<()> {
+        let nt = col.get_notetype_by_name("Basic")?.unwrap();
+        let mut note = nt.new_note();
+        note.tags = vec![tag.to_string()];
+        col.add_note(&mut note, DeckId(1))?;
+        Ok(())
+    }
+
+    #[test]
+    fn reparent_moves_a_subtree_no_note_carries() -> Result<()> {
+        let mut col = Collection::new();
+        add_unused_tags(&mut col, &["parent::child", "parent::child::leaf"])?;
+        assert_eq!(alltags(&col), &["parent::child", "parent::child::leaf"]);
+
+        col.reparent_tags(&["parent::child".into()], Some("target".into()))?;
+
+        assert_eq!(alltags(&col), &["target::child", "target::child::leaf"]);
+        Ok(())
+    }
+
+    #[test]
+    fn reparent_keeps_a_descendant_entry_no_note_carries() -> Result<()> {
+        let mut col = Collection::new();
+        // A note keeps `parent::child` on it, so notes do match ...
+        add_note_with_tag(&mut col, "parent::child")?;
+        // ... while `parent::child::leaf` is only a tag-list entry.
+        add_unused_tags(&mut col, &["parent::child::leaf"])?;
+        assert_eq!(alltags(&col), &["parent::child", "parent::child::leaf"]);
+
+        col.reparent_tags(&["parent::child".into()], Some("target".into()))?;
+
+        // The entry has to be moved, not dropped: it was removed from the tag
+        // list with the rest of the subtree.
+        assert_eq!(alltags(&col), &["target::child", "target::child::leaf"]);
+        Ok(())
+    }
+
+    #[test]
+    fn reparent_to_the_root_moves_a_subtree_no_note_carries() -> Result<()> {
+        let mut col = Collection::new();
+        add_unused_tags(&mut col, &["parent::child", "parent::child::leaf"])?;
+
+        col.reparent_tags(&["parent::child".into()], None)?;
+
+        assert_eq!(alltags(&col), &["child", "child::leaf"]);
+        Ok(())
+    }
+
+    #[test]
+    fn reparenting_nothing_leaves_the_tag_list_alone() -> Result<()> {
+        let mut col = Collection::new();
+        add_unused_tags(&mut col, &["parent::child"])?;
+
+        // a tag that is not in the collection at all
+        let count = col
+            .reparent_tags(&["absent".into()], Some("target".into()))?
+            .output;
+
+        assert_eq!(count, 0);
+        assert_eq!(alltags(&col), &["parent::child"]);
+        Ok(())
+    }
+
+    #[test]
+    fn reparent_returns_the_number_of_changed_notes_not_tags() -> Result<()> {
+        let mut col = Collection::new();
+        add_unused_tags(&mut col, &["parent::child", "parent::child::leaf"])?;
+
+        // The count is a note count, and no note changed.
+        let count = col
+            .reparent_tags(&["parent::child".into()], Some("target".into()))?
+            .output;
+
+        assert_eq!(count, 0);
+        assert_eq!(alltags(&col), &["target::child", "target::child::leaf"]);
+        Ok(())
     }
 
     #[test]
